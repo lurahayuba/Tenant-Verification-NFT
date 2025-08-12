@@ -230,7 +230,7 @@
             (merge landlord-rep {
                 total-verifications-given: (+ (get total-verifications-given landlord-rep) u1)
             }))
-        (update-tenant-reputation tenant)))
+        (ok true)))
 (define-private (update-tenant-reputation (tenant principal))
     (let 
         ((current-rep (default-to { total-verifications: u0, average-payment-score: u0, average-conduct-score: u0, total-weight: u0, last-updated: u0 }
@@ -285,3 +285,185 @@
             reliability: (if (>= (get total-verifications reputation) u3) "high" "medium")
         }))
         (ok none)))
+
+(define-constant err-invalid-dates (err u107))
+(define-constant err-overlapping-rental (err u108))
+(define-constant err-insufficient-funds (err u109))
+(define-constant err-escrow-not-found (err u110))
+(define-constant err-escrow-not-active (err u111))
+(define-constant err-unauthorized-release (err u112))
+
+(define-data-var rental-period-counter uint u0)
+(define-data-var escrow-counter uint u0)
+
+(define-map rental-periods
+    uint
+    {
+        tenant: principal,
+        landlord: principal,
+        property-address: (string-ascii 100),
+        start-date: uint,
+        end-date: uint,
+        monthly-rent: uint,
+        created-at: uint
+    }
+)
+
+(define-map tenant-rental-count
+    principal
+    uint
+)
+
+(define-map payment-escrows
+    uint
+    {
+        tenant: principal,
+        landlord: principal,
+        amount: uint,
+        purpose: (string-ascii 50),
+        status: (string-ascii 20),
+        created-at: uint,
+        release-conditions-met: bool,
+        auto-release-height: uint
+    }
+)
+
+(define-public (record-rental-period
+    (tenant principal)
+    (property-address (string-ascii 100))
+    (start-date uint)
+    (end-date uint)
+    (monthly-rent uint))
+    (let 
+        ((period-id (+ (var-get rental-period-counter) u1))
+         (tenant-count (default-to u0 (map-get? tenant-rental-count tenant))))
+        (asserts! (< start-date end-date) err-invalid-dates)
+        (asserts! (> start-date u0) err-invalid-dates)
+        (asserts! (is-none (check-rental-overlap tenant start-date end-date)) err-overlapping-rental)
+        (var-set rental-period-counter period-id)
+        (map-set rental-periods period-id {
+            tenant: tenant,
+            landlord: tx-sender,
+            property-address: property-address,
+            start-date: start-date,
+            end-date: end-date,
+            monthly-rent: monthly-rent,
+            created-at: stacks-block-height
+        })
+        (map-set tenant-rental-count tenant (+ tenant-count u1))
+        (ok period-id)))
+
+(define-private (check-rental-overlap (tenant principal) (start-date uint) (end-date uint))
+    none)
+
+
+
+(define-read-only (get-rental-period (period-id uint))
+    (ok (map-get? rental-periods period-id)))
+
+(define-read-only (get-tenant-rental-periods (tenant principal))
+    (list))
+
+
+
+(define-read-only (get-tenant-rental-timeline (tenant principal))
+    (let ((periods (get-tenant-rental-periods tenant)))
+        (ok {
+            total-periods: (len periods),
+            rental-history: periods,
+            current-status: (if (> (len periods) u0) "has-history" "no-history")
+        })))
+
+(define-read-only (validate-rental-continuity (tenant principal))
+    (ok {
+        has-gaps: false,
+        consecutive-months: u0,
+        period-count: u0
+    }))
+
+(define-private (check-timeline-gaps 
+    (periods (list 10 {tenant: principal, landlord: principal, property-address: (string-ascii 100), start-date: uint, end-date: uint, monthly-rent: uint, created-at: uint})))
+    (if (<= (len periods) u1)
+        false
+        true))
+
+(define-private (calculate-total-rental-months 
+    (periods (list 10 {tenant: principal, landlord: principal, property-address: (string-ascii 100), start-date: uint, end-date: uint, monthly-rent: uint, created-at: uint})))
+    (fold sum-rental-duration periods u0))
+
+(define-private (sum-rental-duration 
+    (period {tenant: principal, landlord: principal, property-address: (string-ascii 100), start-date: uint, end-date: uint, monthly-rent: uint, created-at: uint})
+    (total uint))
+    (+ total (- (get end-date period) (get start-date period))))
+
+(define-public (create-payment-escrow 
+    (tenant principal)
+    (amount uint)
+    (purpose (string-ascii 50))
+    (auto-release-blocks uint))
+    (let 
+        ((escrow-id (+ (var-get escrow-counter) u1)))
+        (asserts! (> amount u0) err-insufficient-funds)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set escrow-counter escrow-id)
+        (map-set payment-escrows escrow-id {
+            tenant: tenant,
+            landlord: tx-sender,
+            amount: amount,
+            purpose: purpose,
+            status: "active",
+            created-at: stacks-block-height,
+            release-conditions-met: false,
+            auto-release-height: (+ stacks-block-height auto-release-blocks)
+        })
+        (ok escrow-id)))
+
+(define-public (release-escrow (escrow-id uint))
+    (let ((escrow (unwrap! (map-get? payment-escrows escrow-id) err-escrow-not-found)))
+        (asserts! (is-eq (get status escrow) "active") err-escrow-not-active)
+        (asserts! (or 
+            (is-eq tx-sender (get landlord escrow))
+            (is-eq tx-sender (get tenant escrow))
+            (>= stacks-block-height (get auto-release-height escrow))
+        ) err-unauthorized-release)
+        (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (get tenant escrow))))
+        (map-set payment-escrows escrow-id
+            (merge escrow {
+                status: "released",
+                release-conditions-met: true
+            }))
+        (ok true)))
+
+(define-public (refund-escrow (escrow-id uint))
+    (let ((escrow (unwrap! (map-get? payment-escrows escrow-id) err-escrow-not-found)))
+        (asserts! (is-eq (get status escrow) "active") err-escrow-not-active)
+        (asserts! (is-eq tx-sender (get landlord escrow)) err-unauthorized-release)
+        (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (get landlord escrow))))
+        (map-set payment-escrows escrow-id
+            (merge escrow { status: "refunded" }))
+        (ok true)))
+
+(define-public (mark-conditions-met (escrow-id uint))
+    (let ((escrow (unwrap! (map-get? payment-escrows escrow-id) err-escrow-not-found)))
+        (asserts! (is-eq (get status escrow) "active") err-escrow-not-active)
+        (asserts! (is-eq tx-sender (get landlord escrow)) err-unauthorized-release)
+        (ok (map-set payment-escrows escrow-id
+            (merge escrow { release-conditions-met: true })))))
+
+(define-read-only (get-escrow-details (escrow-id uint))
+    (ok (map-get? payment-escrows escrow-id)))
+
+(define-read-only (get-escrow-status (escrow-id uint))
+    (match (map-get? payment-escrows escrow-id)
+        escrow (ok {
+            status: (get status escrow),
+            amount: (get amount escrow),
+            can-release: (or 
+                (get release-conditions-met escrow)
+                (>= stacks-block-height (get auto-release-height escrow))
+            ),
+            blocks-until-auto-release: (if (>= stacks-block-height (get auto-release-height escrow))
+                u0
+                (- (get auto-release-height escrow) stacks-block-height))
+        })
+        (err err-escrow-not-found)))
