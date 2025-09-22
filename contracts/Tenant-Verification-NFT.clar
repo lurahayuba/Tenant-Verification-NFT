@@ -467,3 +467,206 @@
                 (- (get auto-release-height escrow) stacks-block-height))
         })
         (err err-escrow-not-found)))
+
+(define-constant err-invalid-provider (err u113))
+(define-constant err-check-not-found (err u114))
+(define-constant err-check-expired (err u115))
+(define-constant err-already-verified-provider (err u116))
+(define-constant err-insufficient-score (err u117))
+(define-constant err-check-already-exists (err u118))
+
+(define-data-var background-check-counter uint u0)
+
+(define-map authorized-providers
+    principal
+    {
+        provider-name: (string-ascii 64),
+        certification-level: uint,
+        authorized-at: uint,
+        total-checks-completed: uint,
+        reliability-score: uint
+    }
+)
+
+(define-map tenant-background-checks
+    uint
+    {
+        tenant: principal,
+        provider: principal,
+        credit-score: uint,
+        criminal-record-clear: bool,
+        employment-verified: bool,
+        income-verified: bool,
+        previous-evictions: uint,
+        identity-verified: bool,
+        check-date: uint,
+        expiry-date: uint,
+        overall-score: uint,
+        status: (string-ascii 20),
+        verification-hash: (string-ascii 64)
+    }
+)
+
+(define-map tenant-check-lookup
+    principal
+    uint
+)
+
+(define-map provider-check-requests
+    { tenant: principal, provider: principal }
+    {
+        requested-at: uint,
+        landlord: principal,
+        status: (string-ascii 20),
+        fee-paid: uint
+    }
+)
+
+(define-public (authorize-background-provider 
+    (provider principal)
+    (provider-name (string-ascii 64))
+    (certification-level uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= certification-level u5) err-invalid-provider)
+        (asserts! (>= certification-level u1) err-invalid-provider)
+        (ok (map-set authorized-providers provider {
+            provider-name: provider-name,
+            certification-level: certification-level,
+            authorized-at: stacks-block-height,
+            total-checks-completed: u0,
+            reliability-score: u100
+        }))))
+
+(define-public (request-background-check (tenant principal) (provider principal) (fee uint))
+    (let 
+        ((provider-info (unwrap! (map-get? authorized-providers provider) err-invalid-provider))
+         (request-key { tenant: tenant, provider: provider }))
+        (asserts! (is-none (map-get? provider-check-requests request-key)) err-check-already-exists)
+        (asserts! (>= fee u1000000) err-insufficient-funds)
+        (try! (stx-transfer? fee tx-sender provider))
+        (ok (map-set provider-check-requests request-key {
+            requested-at: stacks-block-height,
+            landlord: tx-sender,
+            status: "pending",
+            fee-paid: fee
+        }))))
+
+(define-public (submit-background-check 
+    (tenant principal)
+    (credit-score uint)
+    (criminal-record-clear bool)
+    (employment-verified bool)
+    (income-verified bool)
+    (previous-evictions uint)
+    (identity-verified bool)
+    (verification-hash (string-ascii 64)))
+    (let 
+        ((check-id (+ (var-get background-check-counter) u1))
+         (provider-info (unwrap! (map-get? authorized-providers tx-sender) err-invalid-provider))
+         (request-key { tenant: tenant, provider: tx-sender })
+         (request-info (unwrap! (map-get? provider-check-requests request-key) err-check-not-found))
+         (overall-score (calculate-background-score credit-score criminal-record-clear employment-verified income-verified previous-evictions identity-verified))
+         (expiry-date (+ stacks-block-height u52560)))
+        (asserts! (is-eq (get status request-info) "pending") err-check-not-found)
+        (asserts! (<= credit-score u850) err-invalid-tenant)
+        (asserts! (<= previous-evictions u10) err-invalid-tenant)
+        (var-set background-check-counter check-id)
+        (map-set tenant-background-checks check-id {
+            tenant: tenant,
+            provider: tx-sender,
+            credit-score: credit-score,
+            criminal-record-clear: criminal-record-clear,
+            employment-verified: employment-verified,
+            income-verified: income-verified,
+            previous-evictions: previous-evictions,
+            identity-verified: identity-verified,
+            check-date: stacks-block-height,
+            expiry-date: expiry-date,
+            overall-score: overall-score,
+            status: "completed",
+            verification-hash: verification-hash
+        })
+        (map-set tenant-check-lookup tenant check-id)
+        (map-set provider-check-requests request-key
+            (merge request-info { status: "completed" }))
+        (map-set authorized-providers tx-sender
+            (merge provider-info {
+                total-checks-completed: (+ (get total-checks-completed provider-info) u1)
+            }))
+        (ok check-id)))
+
+(define-private (calculate-background-score 
+    (credit-score uint)
+    (criminal-clear bool)
+    (employment-verified bool)
+    (income-verified bool)
+    (evictions uint)
+    (identity-verified bool))
+    (let 
+        ((credit-weight (if (>= credit-score u700) u30 (if (>= credit-score u650) u20 u10)))
+         (criminal-weight (if criminal-clear u25 u0))
+         (employment-weight (if employment-verified u20 u0))
+         (income-weight (if income-verified u15 u0))
+         (eviction-weight (if (is-eq evictions u0) u10 u0))
+         (identity-weight (if identity-verified u10 u0)))
+        (+ credit-weight criminal-weight employment-weight income-weight eviction-weight identity-weight)))
+
+(define-public (verify-background-check (tenant principal) (expected-hash (string-ascii 64)))
+    (let 
+        ((check-id (unwrap! (map-get? tenant-check-lookup tenant) err-check-not-found))
+         (check-data (unwrap! (map-get? tenant-background-checks check-id) err-check-not-found)))
+        (asserts! (is-eq (get verification-hash check-data) expected-hash) err-invalid-tenant)
+        (asserts! (< stacks-block-height (get expiry-date check-data)) err-check-expired)
+        (ok {
+            verified: true,
+            score: (get overall-score check-data),
+            provider: (get provider check-data),
+            check-date: (get check-date check-data)
+        })))
+
+(define-public (update-provider-reliability (provider principal) (new-score uint))
+    (let ((provider-info (unwrap! (map-get? authorized-providers provider) err-invalid-provider)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= new-score u100) err-invalid-tenant)
+        (ok (map-set authorized-providers provider
+            (merge provider-info { reliability-score: new-score })))))
+
+(define-read-only (get-background-check (tenant principal))
+    (match (map-get? tenant-check-lookup tenant)
+        check-id (ok (map-get? tenant-background-checks check-id))
+        (ok none)))
+
+(define-read-only (get-provider-info (provider principal))
+    (ok (map-get? authorized-providers provider)))
+
+(define-read-only (get-check-request-status (tenant principal) (provider principal))
+    (ok (map-get? provider-check-requests { tenant: tenant, provider: provider })))
+
+(define-read-only (is-background-check-valid (tenant principal))
+    (match (map-get? tenant-check-lookup tenant)
+        check-id (match (map-get? tenant-background-checks check-id)
+            check-data (ok {
+                valid: (< stacks-block-height (get expiry-date check-data)),
+                score: (get overall-score check-data),
+                days-until-expiry: (if (< stacks-block-height (get expiry-date check-data))
+                    (/ (- (get expiry-date check-data) stacks-block-height) u144)
+                    u0),
+                risk-level: (if (>= (get overall-score check-data) u80) "low" 
+                               (if (>= (get overall-score check-data) u60) "medium" "high"))
+            })
+            (ok { valid: false, score: u0, days-until-expiry: u0, risk-level: "unknown" }))
+        (ok { valid: false, score: u0, days-until-expiry: u0, risk-level: "unknown" })))
+
+(define-read-only (get-tenant-screening-summary (tenant principal))
+    (let 
+        ((background-check (get-background-check tenant))
+         (reputation-data (get-tenant-reputation tenant)))
+        (ok {
+            has-background-check: (is-some (unwrap-panic background-check)),
+            has-reputation: (is-some (unwrap-panic reputation-data)),
+            screening-complete: (and 
+                (is-some (unwrap-panic background-check))
+                (is-some (unwrap-panic reputation-data))
+            )
+        })))
