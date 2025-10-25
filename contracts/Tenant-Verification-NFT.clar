@@ -670,3 +670,128 @@
                 (is-some (unwrap-panic reputation-data))
             )
         })))
+
+(define-constant err-reward-claimed (err u119))
+(define-constant err-insufficient-reputation (err u120))
+(define-constant err-reward-pool-empty (err u121))
+(define-constant err-no-rewards-available (err u122))
+
+(define-data-var reward-pool uint u0)
+(define-data-var total-rewards-distributed uint u0)
+(define-data-var reward-cycle-length uint u4320)
+
+(define-map landlord-reward-claims
+    { landlord: principal, cycle: uint }
+    {
+        amount: uint,
+        claimed-at: uint,
+        reputation-snapshot: uint
+    }
+)
+
+(define-map landlord-reward-eligibility
+    principal
+    {
+        last-claim-cycle: uint,
+        total-rewards-earned: uint,
+        reward-tier: uint
+    }
+)
+
+(define-public (fund-reward-pool (amount uint))
+    (begin
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set reward-pool (+ (var-get reward-pool) amount))
+        (ok true)))
+
+(define-public (claim-landlord-reward)
+    (let 
+        ((current-cycle (/ stacks-block-height (var-get reward-cycle-length)))
+         (landlord-rep (unwrap! (map-get? landlord-reputation tx-sender) err-insufficient-reputation))
+         (claim-key { landlord: tx-sender, cycle: current-cycle })
+         (eligibility (default-to 
+             { last-claim-cycle: u0, total-rewards-earned: u0, reward-tier: u1 }
+             (map-get? landlord-reward-eligibility tx-sender)))
+         (reward-amount (calculate-landlord-reward 
+             (get total-verifications-given landlord-rep)
+             (get reputation-weight landlord-rep))))
+        (asserts! (> (get total-verifications-given landlord-rep) u4) err-insufficient-reputation)
+        (asserts! (>= (get reputation-weight landlord-rep) u3) err-insufficient-reputation)
+        (asserts! (not (is-eq (get last-claim-cycle eligibility) current-cycle)) err-reward-claimed)
+        (asserts! (> reward-amount u0) err-no-rewards-available)
+        (asserts! (>= (var-get reward-pool) reward-amount) err-reward-pool-empty)
+        (try! (as-contract (stx-transfer? reward-amount tx-sender tx-sender)))
+        (var-set reward-pool (- (var-get reward-pool) reward-amount))
+        (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) reward-amount))
+        (map-set landlord-reward-claims claim-key {
+            amount: reward-amount,
+            claimed-at: stacks-block-height,
+            reputation-snapshot: (get reputation-weight landlord-rep)
+        })
+        (map-set landlord-reward-eligibility tx-sender {
+            last-claim-cycle: current-cycle,
+            total-rewards-earned: (+ (get total-rewards-earned eligibility) reward-amount),
+            reward-tier: (calculate-reward-tier (get total-verifications-given landlord-rep))
+        })
+        (ok reward-amount)))
+
+(define-private (calculate-landlord-reward (verifications-given uint) (reputation-weight uint))
+    (let 
+        ((base-reward u1000000)
+         (verification-multiplier (if (>= verifications-given u20) u3
+                                   (if (>= verifications-given u10) u2 u1)))
+         (weight-multiplier reputation-weight))
+        (* (* base-reward verification-multiplier) weight-multiplier)))
+
+(define-private (calculate-reward-tier (verifications uint))
+    (if (>= verifications u50) u5
+    (if (>= verifications u30) u4
+    (if (>= verifications u20) u3
+    (if (>= verifications u10) u2 u1)))))
+
+(define-public (update-reward-cycle-length (new-length uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (>= new-length u144) err-invalid-tenant)
+        (var-set reward-cycle-length new-length)
+        (ok true)))
+
+(define-read-only (get-reward-pool-balance)
+    (ok (var-get reward-pool)))
+
+(define-read-only (get-landlord-reward-info (landlord principal))
+    (let 
+        ((eligibility (map-get? landlord-reward-eligibility landlord))
+         (landlord-rep (map-get? landlord-reputation landlord))
+         (current-cycle (/ stacks-block-height (var-get reward-cycle-length))))
+        (ok {
+            eligibility-data: eligibility,
+            reputation-data: landlord-rep,
+            current-cycle: current-cycle,
+            can-claim: (match landlord-rep
+                rep (and 
+                    (> (get total-verifications-given rep) u4)
+                    (>= (get reputation-weight rep) u3)
+                    (match eligibility
+                        elig (not (is-eq (get last-claim-cycle elig) current-cycle))
+                        true))
+                false)
+        })))
+
+(define-read-only (get-potential-reward (landlord principal))
+    (match (map-get? landlord-reputation landlord)
+        rep (ok (some (calculate-landlord-reward 
+            (get total-verifications-given rep)
+            (get reputation-weight rep))))
+        (ok none)))
+
+(define-read-only (get-reward-claim-history (landlord principal) (cycle uint))
+    (ok (map-get? landlord-reward-claims { landlord: landlord, cycle: cycle })))
+
+(define-read-only (get-reward-stats)
+    (ok {
+        pool-balance: (var-get reward-pool),
+        total-distributed: (var-get total-rewards-distributed),
+        cycle-length: (var-get reward-cycle-length),
+        current-cycle: (/ stacks-block-height (var-get reward-cycle-length))
+    }))
