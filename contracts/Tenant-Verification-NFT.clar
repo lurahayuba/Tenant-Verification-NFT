@@ -795,3 +795,196 @@
         cycle-length: (var-get reward-cycle-length),
         current-cycle: (/ stacks-block-height (var-get reward-cycle-length))
     }))
+
+(define-constant err-transfer-not-approved (err u123))
+(define-constant err-sublease-not-allowed (err u124))
+(define-constant err-sublease-exists (err u125))
+(define-constant err-invalid-transfer (err u126))
+
+(define-data-var transfer-counter uint u0)
+
+(define-map transfer-approvals
+    uint
+    {
+        from-tenant: principal,
+        to-tenant: principal,
+        landlord: principal,
+        approved-by-landlord: bool,
+        approved-by-from-tenant: bool,
+        transfer-fee: uint,
+        requested-at: uint,
+        expires-at: uint,
+        status: (string-ascii 20)
+    }
+)
+
+(define-map token-transfer-lookup
+    uint
+    uint
+)
+
+(define-map sublease-agreements
+    uint
+    {
+        token-id: uint,
+        primary-tenant: principal,
+        sublease-tenant: principal,
+        landlord: principal,
+        start-date: uint,
+        end-date: uint,
+        sublease-rent: uint,
+        approved: bool,
+        created-at: uint,
+        status: (string-ascii 20)
+    }
+)
+
+(define-map active-subleases
+    uint
+    uint
+)
+
+(define-public (request-tenant-transfer
+    (token-id uint)
+    (to-tenant principal)
+    (transfer-fee uint))
+    (let
+        ((profile (unwrap! (map-get? tenant-profiles token-id) err-invalid-tenant))
+         (transfer-id (+ (var-get transfer-counter) u1))
+         (expiry-height (+ stacks-block-height u1440)))
+        (asserts! (is-eq tx-sender (get tenant profile)) err-not-token-owner)
+        (asserts! (is-none (map-get? token-transfer-lookup token-id)) err-invalid-transfer)
+        (asserts! (not (is-eq (get tenant profile) to-tenant)) err-invalid-transfer)
+        (var-set transfer-counter transfer-id)
+        (map-set transfer-approvals transfer-id {
+            from-tenant: tx-sender,
+            to-tenant: to-tenant,
+            landlord: (get landlord profile),
+            approved-by-landlord: false,
+            approved-by-from-tenant: true,
+            transfer-fee: transfer-fee,
+            requested-at: stacks-block-height,
+            expires-at: expiry-height,
+            status: "pending"
+        })
+        (map-set token-transfer-lookup token-id transfer-id)
+        (ok transfer-id)))
+
+(define-public (approve-tenant-transfer (transfer-id uint))
+    (let
+        ((transfer (unwrap! (map-get? transfer-approvals transfer-id) err-invalid-transfer)))
+        (asserts! (is-eq tx-sender (get landlord transfer)) err-owner-only)
+        (asserts! (is-eq (get status transfer) "pending") err-invalid-transfer)
+        (asserts! (< stacks-block-height (get expires-at transfer)) err-check-expired)
+        (ok (map-set transfer-approvals transfer-id
+            (merge transfer {
+                approved-by-landlord: true,
+                status: "approved"
+            })))))
+
+(define-public (execute-tenant-transfer (token-id uint))
+    (let
+        ((transfer-id (unwrap! (map-get? token-transfer-lookup token-id) err-invalid-transfer))
+         (transfer (unwrap! (map-get? transfer-approvals transfer-id) err-invalid-transfer))
+         (profile (unwrap! (map-get? tenant-profiles token-id) err-invalid-tenant)))
+        (asserts! (is-eq (get status transfer) "approved") err-transfer-not-approved)
+        (asserts! (get approved-by-landlord transfer) err-transfer-not-approved)
+        (asserts! (< stacks-block-height (get expires-at transfer)) err-check-expired)
+        (asserts! (is-eq tx-sender (get to-tenant transfer)) err-not-token-owner)
+        (if (> (get transfer-fee transfer) u0)
+            (try! (stx-transfer? (get transfer-fee transfer) tx-sender (get from-tenant transfer)))
+            true)
+        (try! (nft-transfer? tenant-verification token-id (get from-tenant transfer) (get to-tenant transfer)))
+        (map-set tenant-profiles token-id
+            (merge profile { tenant: (get to-tenant transfer) }))
+        (map-set transfer-approvals transfer-id
+            (merge transfer { status: "completed" }))
+        (map-delete token-transfer-lookup token-id)
+        (ok true)))
+
+(define-public (request-sublease
+    (token-id uint)
+    (sublease-tenant principal)
+    (start-date uint)
+    (end-date uint)
+    (sublease-rent uint))
+    (let
+        ((profile (unwrap! (map-get? tenant-profiles token-id) err-invalid-tenant))
+         (sublease-id (+ (var-get transfer-counter) u1)))
+        (asserts! (is-eq tx-sender (get tenant profile)) err-not-token-owner)
+        (asserts! (is-none (map-get? active-subleases token-id)) err-sublease-exists)
+        (asserts! (< start-date end-date) err-invalid-dates)
+        (asserts! (< stacks-block-height end-date) err-invalid-dates)
+        (var-set transfer-counter sublease-id)
+        (map-set sublease-agreements sublease-id {
+            token-id: token-id,
+            primary-tenant: tx-sender,
+            sublease-tenant: sublease-tenant,
+            landlord: (get landlord profile),
+            start-date: start-date,
+            end-date: end-date,
+            sublease-rent: sublease-rent,
+            approved: false,
+            created-at: stacks-block-height,
+            status: "pending"
+        })
+        (map-set active-subleases token-id sublease-id)
+        (ok sublease-id)))
+
+(define-public (approve-sublease (sublease-id uint))
+    (let
+        ((sublease (unwrap! (map-get? sublease-agreements sublease-id) err-invalid-transfer)))
+        (asserts! (is-eq tx-sender (get landlord sublease)) err-owner-only)
+        (asserts! (is-eq (get status sublease) "pending") err-invalid-transfer)
+        (ok (map-set sublease-agreements sublease-id
+            (merge sublease {
+                approved: true,
+                status: "active"
+            })))))
+
+(define-public (terminate-sublease (sublease-id uint))
+    (let
+        ((sublease (unwrap! (map-get? sublease-agreements sublease-id) err-invalid-transfer)))
+        (asserts! (or
+            (is-eq tx-sender (get primary-tenant sublease))
+            (is-eq tx-sender (get landlord sublease))
+            (>= stacks-block-height (get end-date sublease)))
+            err-owner-only)
+        (map-set sublease-agreements sublease-id
+            (merge sublease { status: "terminated" }))
+        (map-delete active-subleases (get token-id sublease))
+        (ok true)))
+
+(define-public (cancel-transfer-request (transfer-id uint))
+    (let
+        ((transfer (unwrap! (map-get? transfer-approvals transfer-id) err-invalid-transfer)))
+        (asserts! (is-eq tx-sender (get from-tenant transfer)) err-not-token-owner)
+        (asserts! (is-eq (get status transfer) "pending") err-invalid-transfer)
+        (map-set transfer-approvals transfer-id
+            (merge transfer { status: "cancelled" }))
+        (ok true)))
+
+(define-read-only (get-transfer-details (transfer-id uint))
+    (ok (map-get? transfer-approvals transfer-id)))
+
+(define-read-only (get-token-transfer-request (token-id uint))
+    (match (map-get? token-transfer-lookup token-id)
+        transfer-id (ok (map-get? transfer-approvals transfer-id))
+        (ok none)))
+
+(define-read-only (get-sublease-details (sublease-id uint))
+    (ok (map-get? sublease-agreements sublease-id)))
+
+(define-read-only (get-active-sublease (token-id uint))
+    (match (map-get? active-subleases token-id)
+        sublease-id (ok (map-get? sublease-agreements sublease-id))
+        (ok none)))
+
+(define-read-only (is-token-transferable (token-id uint))
+    (match (map-get? tenant-profiles token-id)
+        profile (ok {
+            transferable: (is-none (map-get? token-transfer-lookup token-id)),
+            has-active-sublease: (is-some (map-get? active-subleases token-id)),
+            current-owner: (get tenant profile)
+        })
+        (ok { transferable: false, has-active-sublease: false, current-owner: tx-sender })))
